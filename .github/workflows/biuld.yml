@@ -1,88 +1,48 @@
-name: Build Napster Config Generator
+name: Build & Release
 
 on:
   push:
     branches: [ main, master ]
-  release:
-    types: [ created ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  build:
-    name: Build for all platforms
+  build-and-release:
     runs-on: ubuntu-latest
-
     steps:
-      - name: ⬇️ Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 🔧 Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.22'
 
-      - name: 📦 Download dependencies
+      - name: Download dependencies
         run: go mod download
 
-      - name: 🪟 Build Windows (64-bit)
-        env:
-          GOOS: windows
-          GOARCH: amd64
-          CGO_ENABLED: 0
+      - name: Build all platforms
         run: |
-          go build -ldflags="-s -w" -o napster-config-windows-amd64.exe .
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o napster-windows-amd64.exe .
+          CGO_ENABLED=0 GOOS=windows GOARCH=386   go build -ldflags="-s -w" -o napster-windows-386.exe .
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -ldflags="-s -w" -o napster-linux-amd64 .
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -ldflags="-s -w" -o napster-macos-arm64 .
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64 go build -ldflags="-s -w" -o napster-macos-amd64 .
 
-      - name: 🪟 Build Windows (32-bit)
-        env:
-          GOOS: windows
-          GOARCH: 386
-          CGO_ENABLED: 0
-        run: |
-          go build -ldflags="-s -w" -o napster-config-windows-386.exe .
+      - name: Generate tag
+        id: tag
+        run: echo "tag=v$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
 
-      - name: 🐧 Build Linux (64-bit)
-        env:
-          GOOS: linux
-          GOARCH: amd64
-          CGO_ENABLED: 0
-        run: |
-          go build -ldflags="-s -w" -o napster-config-linux-amd64 .
-
-      - name: 🍎 Build macOS (Apple Silicon)
-        env:
-          GOOS: darwin
-          GOARCH: arm64
-          CGO_ENABLED: 0
-        run: |
-          go build -ldflags="-s -w" -o napster-config-macos-arm64 .
-
-      - name: 🍎 Build macOS (Intel)
-        env:
-          GOOS: darwin
-          GOARCH: amd64
-          CGO_ENABLED: 0
-        run: |
-          go build -ldflags="-s -w" -o napster-config-macos-amd64 .
-
-      - name: 📤 Upload all artifacts
-        uses: actions/upload-artifact@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: napster-config-all-builds
-          path: |
-            napster-config-windows-amd64.exe
-            napster-config-windows-386.exe
-            napster-config-linux-amd64
-            napster-config-macos-arm64
-            napster-config-macos-amd64
-          retention-days: 30
-
-      - name: 🚀 Upload to Release (if triggered by release)
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v1
-        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Release ${{ steps.tag.outputs.tag }}"
+          draft: false
+          prerelease: false
           files: |
-            napster-config-windows-amd64.exe
-            napster-config-windows-386.exe
-            napster-config-linux-amd64
-            napster-config-macos-arm64
-            napster-config-macos-amd64
+            napster-windows-amd64.exe
+            napster-windows-386.exe
+            napster-linux-amd64
+            napster-macos-arm64
+            napster-macos-amd64
