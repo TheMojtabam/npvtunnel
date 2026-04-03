@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"golang.org/x/crypto/pbkdf2"
+
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -184,12 +184,26 @@ func defaultSettings() NapsterSettings {
 // ENCRYPTION
 // ─────────────────────────────────────────────────────────────────────────────
 
+
+func deriveKey(password string, salt []byte) []byte {
+	key := make([]byte, 32)
+	h := sha256.New()
+	for i := 0; i < 10000; i++ {
+		h.Write([]byte(password))
+		h.Write(salt)
+		h.Write(key)
+		copy(key, h.Sum(nil))
+		h.Reset()
+	}
+	return key
+}
+
 func encryptConfig(plaintext, password string) (string, error) {
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {
 		return "", err
 	}
-	key := pbkdf2.Key([]byte(password), salt, 100000, 32, sha256.New)
+	key := deriveKey(password, salt)
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
@@ -220,7 +234,7 @@ func decryptConfig(encrypted, password string) (string, error) {
 	}
 	salt := data[:16]
 	ciphertext := data[16:]
-	key := pbkdf2.Key([]byte(password), salt, 100000, 32, sha256.New)
+	key := deriveKey(password, salt)
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
@@ -1355,14 +1369,14 @@ function showParsed(d,err){
   if(err){el.innerHTML='<span style="color:var(--red)">❌ '+err+'</span>';el.classList.add('show');return;}
   const proto=d.protocol.toUpperCase();
   const id=d.uuid||d.password||'-';
-  let html=`<span class="pbadge">${proto}</span> `;
-  if(d.remarks) html+=`<b>${d.remarks}</b><br>`;
-  html+=`🖥️ <b>${d.address}:${d.port}</b> &nbsp; 🌐 ${d.network||'tcp'} &nbsp; 🔒 ${d.tls||'none'}<br>`;
-  html+=`🔑 ${id.substring(0,28)}${id.length>28?'...':''}`;
-  if(d.flow) html+=`<br>⚡ flow: ${d.flow}`;
-  if(d.publicKey) html+=`<br>🔑 Reality PubKey: ${d.publicKey.substring(0,20)}...`;
-  if(d.sni) html+=`<br>🌍 SNI: ${d.sni}`;
-  if(d.fingerprint) html+=`<br>🖱️ fp: ${d.fingerprint}`;
+  let html='<span class="pbadge">'+proto+'</span> ';
+  if(d.remarks) html+='<b>'+d.remarks+'</b><br>';
+  html+='🖥️ <b>'+d.address+':'+d.port+'</b> &nbsp; 🌐 '+(d.network||'tcp')+' &nbsp; 🔒 '+(d.tls||'none')+'<br>';
+  html+='🔑 '+id.substring(0,28)+(id.length>28?'...':'');
+  if(d.flow) html+='<br>⚡ flow: '+d.flow;
+  if(d.publicKey) html+='<br>🔑 Reality PubKey: '+d.publicKey.substring(0,20)+'...';
+  if(d.sni) html+='<br>🌍 SNI: '+d.sni;
+  if(d.fingerprint) html+='<br>🖱️ fp: '+d.fingerprint;
   el.innerHTML=html; el.classList.add('show');
 }
 
@@ -1376,13 +1390,13 @@ async function fetchServerInfo(addr){
     const r=await fetch('/api/server-info?address='+encodeURIComponent(addr));
     const d=await r.json();
     const pingClass=d.status==='online'?'ping-ok':'ping-err';
-    grid.innerHTML=`
-      <div class="si-item"><div class="si-label">وضعیت</div>
-        <div class="si-val"><span class="ping-badge ${pingClass}">${d.status==='online'?'🟢 آنلاین':'🔴 آفلاین'}</span></div></div>
-      <div class="si-item"><div class="si-label">پینگ</div><div class="si-val">${d.ping}</div></div>
-      <div class="si-item"><div class="si-label">کشور</div><div class="si-val">${d.countryCode||''} ${d.country||'N/A'}</div></div>
-      <div class="si-item"><div class="si-label">ISP/Org</div><div class="si-val" style="font-size:11px">${d.org||'N/A'}</div></div>
-    `;
+    const statusLabel=d.status==='online'?'🟢 آنلاین':'🔴 آفلاین';
+    grid.innerHTML=
+      '<div class="si-item"><div class="si-label">وضعیت</div>'+
+        '<div class="si-val"><span class="ping-badge '+pingClass+'">'+statusLabel+'</span></div></div>'+
+      '<div class="si-item"><div class="si-label">پینگ</div><div class="si-val">'+d.ping+'</div></div>'+
+      '<div class="si-item"><div class="si-label">کشور</div><div class="si-val">'+(d.countryCode||'')+' '+(d.country||'N/A')+'</div></div>'+
+      '<div class="si-item"><div class="si-label">ISP/Org</div><div class="si-val" style="font-size:11px">'+(d.org||'N/A')+'</div></div>';
   }catch(e){grid.innerHTML='<div style="color:var(--text2);font-size:12px">خطا در دریافت اطلاعات سرور</div>';}
 }
 
@@ -1508,22 +1522,23 @@ async function loadProfiles(){
       c.innerHTML='<div style="color:var(--text2);font-size:13px;text-align:center;padding:40px">هنوز پروفایلی ذخیره نشده</div>';
       return;
     }
-    c.innerHTML=d.profiles.slice().reverse().map(p=>`
-      <div class="prof-card">
-        <div class="prof-name">${p.name||'بدون نام'}</div>
-        <div class="prof-meta">
-          <span>📅 ${p.createdAt}</span>
-          <span class="pbadge" style="font-size:10px">${(p.parsedProxy.protocol||'?').toUpperCase()}</span>
-          <span>🖥️ ${p.parsedProxy.address||'?'}:${p.parsedProxy.port||'?'}</span>
-          ${p.settings.enableDeviceLock?'<span>🔒 Device Locked</span>':''}
-          ${p.settings.enablePassword?'<span>🔐 رمزگذاری شده</span>':''}
-        </div>
-        <div class="prof-actions">
-          <button class="btn btn-sm" onclick="viewProfile('${p.id}')">👁️ مشاهده</button>
-          <button class="btn btn-sm" onclick="loadProfile('${p.id}')">✏️ بارگذاری</button>
-          <button class="btn btn-red" style="font-size:12px;padding:7px 12px" onclick="deleteProfile('${p.id}')">🗑️</button>
-        </div>
-      </div>`).join('');
+    c.innerHTML=d.profiles.slice().reverse().map(function(p){
+      return '<div class="prof-card">'+
+        '<div class="prof-name">'+(p.name||'بدون نام')+'</div>'+
+        '<div class="prof-meta">'+
+          '<span>📅 '+p.createdAt+'</span>'+
+          '<span class="pbadge" style="font-size:10px">'+((p.parsedProxy.protocol||'?').toUpperCase())+'</span>'+
+          '<span>🖥️ '+(p.parsedProxy.address||'?')+':'+(p.parsedProxy.port||'?')+'</span>'+
+          (p.settings.enableDeviceLock?'<span>🔒 Device Locked</span>':'')+
+          (p.settings.enablePassword?'<span>🔐 رمزگذاری شده</span>':'')+
+        '</div>'+
+        '<div class="prof-actions">'+
+          '<button class="btn btn-sm" onclick="viewProfile(''+p.id+'')">👁️ مشاهده</button>'+
+          '<button class="btn btn-sm" onclick="loadProfile(''+p.id+'')">✏️ بارگذاری</button>'+
+          '<button class="btn btn-red" style="font-size:12px;padding:7px 12px" onclick="deleteProfile(''+p.id+'')">🗑️</button>'+
+        '</div>'+
+      '</div>';
+    }).join('');
   }catch(e){}
 }
 
@@ -1617,12 +1632,12 @@ async function importConfig(){
     document.getElementById('importOutput').value=d.decrypted;
     const info=d.info||{};
     let infoHtml='';
-    if(info.name) infoHtml+=`<div>📝 نام پروکسی: <b>${info.name}</b></div>`;
-    if(info.protocol) infoHtml+=`<div>🔌 پروتکل: <b>${info.protocol}</b></div>`;
-    if(info.server) infoHtml+=`<div>🖥️ سرور: <b>${info.server}</b></div>`;
-    if(info.mode) infoHtml+=`<div>🗺️ Mode: <b>${info.mode}</b></div>`;
-    if(info.deviceLock) infoHtml+=`<div>🔒 Device Lock: <b>${info.deviceLock}</b></div>`;
-    if(info.userAgent) infoHtml+=`<div>📱 User-Agent: <b>${info.userAgent}</b></div>`;
+    if(info.name) infoHtml+='<div>📝 نام پروکسی: <b>'+info.name+'</b></div>';
+    if(info.protocol) infoHtml+='<div>🔌 پروتکل: <b>'+info.protocol+'</b></div>';
+    if(info.server) infoHtml+='<div>🖥️ سرور: <b>'+info.server+'</b></div>';
+    if(info.mode) infoHtml+='<div>🗺️ Mode: <b>'+info.mode+'</b></div>';
+    if(info.deviceLock) infoHtml+='<div>🔒 Device Lock: <b>'+info.deviceLock+'</b></div>';
+    if(info.userAgent) infoHtml+='<div>📱 User-Agent: <b>'+info.userAgent+'</b></div>';
     if(!infoHtml) infoHtml='<span style="color:var(--text2)">اطلاعات اضافی‌ای استخراج نشد</span>';
     document.getElementById('importInfo').innerHTML=infoHtml;
     result.style.display='block';
