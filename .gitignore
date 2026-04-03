@@ -1,4 +1,3 @@
-napster-config
-napster-config.exe
-napster-config-*
+napster-*
 *.exe
+config.json
