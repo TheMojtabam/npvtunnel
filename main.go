@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -103,7 +104,7 @@ type GenerateResponse struct {
 	Error     string `json:"error,omitempty"`
 }
 
-// NPVT is the Napster proprietary config format
+// NpvtFile is the Napster proprietary config format
 type NpvtFile struct {
 	Version     int             `json:"version"`
 	CreatedAt   string          `json:"createdAt"`
@@ -239,6 +240,7 @@ func decrypt(enc, password string) (string, error) {
 // ─── V2Ray Parsers ────────────────────────────────────────────────────────────
 
 func tryDecodeBase64(s string) ([]byte, error) {
+	// try all base64 variants
 	encs := []base64.Encoding{
 		*base64.StdEncoding,
 		*base64.RawStdEncoding,
@@ -479,25 +481,23 @@ func buildNapsterConfig(p V2RayConfig, s NapsterSettings) string {
 
 	w("# Napster Config Generator v3\n")
 	w("# Generated: %s\n", time.Now().Format("2006-01-02 15:04"))
-	if s.EnableDeviceLock && s.DeviceID != "" {
-		w("# device-lock: %s\n", s.DeviceID)
-	}
-	if s.UserAgent != "" {
-		w("# user-agent: %s\n", s.UserAgent)
-	}
+	// NOTE: device-lock and user-agent are stored in the .npvt metadata,
+	// NOT as comments in the yaml — Napster reads them from the npvt file.
 	w("\nmixed-port: 7890\nsocks-port: 7891\nport: 7892\nredir-port: 7893\n\n")
 	w("mode: %s\nallow-lan: false\nlog-level: %s\nipv6: %v\n\n", s.ProxyMode, s.LogLevel, s.EnableIPv6)
 	w("external-controller: 127.0.0.1:9090\nsecret: \"\"\n\n")
 
 	name := p.Remarks
 	if name == "" {
-		name = fmt.Sprintf("%s-%s:%d", strings.ToUpper(p.Protocol), p.Address, p.Port)
+		name = fmt.Sprintf("%s-%s-%d", strings.ToUpper(p.Protocol), p.Address, p.Port)
 	}
 
 	// DNS
 	w("dns:\n  enable: true\n  enhanced-mode: %s\n  listen: 0.0.0.0:53\n  use-hosts: true\n  respect-rules: true\n", s.DNSMode)
 	if s.DNSMode == "fake-ip" {
-		w("  fake-ip-range: 198.18.0.0/15\n  fake-ip-filter:\n    - '*.lan'\n    - '*.local'\n")
+		// BUG FIX: fake-ip-filter uses '.lan' and '.local' (no asterisk prefix)
+		// Clash/Mihomo format requires leading dot for suffix match
+		w("  fake-ip-range: 198.18.0.0/15\n  fake-ip-filter:\n    - '.lan'\n    - '.local'\n")
 	}
 	if s.EnableDNSoTLS {
 		w("  default-nameserver:\n    - %s\n  nameserver:\n    - tls://%s\n", s.DNSServer, s.DNSoTLSServer)
@@ -583,6 +583,7 @@ func buildNapsterConfig(p V2RayConfig, s NapsterSettings) string {
 			}
 		}
 	}
+	// Local/private IPs always direct
 	for _, ip := range []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"} {
 		w("  - IP-CIDR,%s,DIRECT,no-resolve\n", ip)
 	}
@@ -636,6 +637,253 @@ func writeNetworkOpts(b *strings.Builder, p V2RayConfig) {
 
 // ─── NPVT Format ──────────────────────────────────────────────────────────────
 
+// parseNpvtLegacy handles the "NPVT1 salt,ciphertext,tag" format
+// that Napster app itself produces when locking a config.
+// Format: NPVT1 <base64_salt>,<base64_ciphertext>,<base64_tag>
+// The three parts together form: salt(16) + nonce(12) + ciphertext + gcm_tag
+func parseNpvtLegacy(content string, password string) (*NpvtFile, string, error) {
+	// Strip "NPVT1 " prefix
+	body := strings.TrimPrefix(content, "NPVT1 ")
+	body = strings.TrimSpace(body)
+
+	parts := strings.SplitN(body, ",", 3)
+	if len(parts) != 3 {
+		return nil, "", fmt.Errorf("فرمت NPVT1 نامعتبر است")
+	}
+
+	saltBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return nil, "", fmt.Errorf("salt نامعتبر در فایل NPVT1")
+	}
+
+	cipherBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return nil, "", fmt.Errorf("ciphertext نامعتبر در فایل NPVT1")
+	}
+
+	tagBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(parts[2]))
+	if err != nil {
+		return nil, "", fmt.Errorf("tag نامعتبر در فایل NPVT1")
+	}
+
+	if password == "" {
+		return nil, "", fmt.Errorf("NEEDS_PASSWORD")
+	}
+
+	// Derive key from password + salt
+	key := deriveKey(password, saltBytes)
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// nonce is first NonceSize bytes of cipherBytes
+	ns := gcm.NonceSize()
+	if len(cipherBytes) < ns {
+		return nil, "", fmt.Errorf("داده ناقص در NPVT1")
+	}
+
+	nonce := cipherBytes[:ns]
+	// ciphertext = rest of cipherBytes + tagBytes appended
+	ciphertext := append(cipherBytes[ns:], tagBytes...)
+
+	plain, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		// Try alternative: treat cipherBytes as nonce+ct and tagBytes as GCM tag
+		// Some implementations store them separately
+		if len(saltBytes) >= ns {
+			nonce2 := saltBytes[:ns]
+			ct2 := append(cipherBytes, tagBytes...)
+			plain2, err2 := gcm.Open(nil, nonce2, ct2, nil)
+			if err2 == nil {
+				plain = plain2
+			} else {
+				return nil, "", fmt.Errorf("رمز اشتباه است یا فایل خراب")
+			}
+		} else {
+			return nil, "", fmt.Errorf("رمز اشتباه است")
+		}
+	}
+
+	// The decrypted content should be a Clash/Mihomo YAML config
+	configText := string(plain)
+
+	// Build a synthetic NpvtFile from the raw config
+	// Try to extract proxy info from the YAML
+	syntheticNpvt := &NpvtFile{
+		Version:   1,
+		CreatedAt: time.Now().Format("2006-01-02T15:04:05Z"),
+		Config:    configText,
+		Encrypted: true,
+	}
+
+	// Try to parse proxy from the config YAML (best-effort)
+	v2link := extractV2LinkFromConfig(configText)
+	if v2link != "" {
+		syntheticNpvt.V2RayLink = v2link
+		if cfg, err := parseV2RayLink(v2link); err == nil {
+			syntheticNpvt.ParsedProxy = cfg
+		}
+	}
+
+	return syntheticNpvt, v2link, nil
+}
+
+// extractV2LinkFromConfig tries to reconstruct a v2ray link from Clash YAML config text
+func extractV2LinkFromConfig(configText string) string {
+	lines := strings.Split(configText, "\n")
+	var (
+		inProxies  bool
+		inProxy    bool
+		proxyType  string
+		server     string
+		port       int
+		uuid       string
+		password   string
+		tls        bool
+		sni        string
+		network    string
+		path       string
+		host       string
+		flow       string
+		fp         string
+		pubkey     string
+		shortid    string
+		remarks    string
+		tlsSec     string
+	)
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "proxies:" {
+			inProxies = true
+			continue
+		}
+		if inProxies && strings.HasPrefix(trimmed, "- name:") {
+			inProxy = true
+			remarks = strings.Trim(strings.TrimPrefix(trimmed, "- name:"), " \"")
+			continue
+		}
+		if inProxy {
+			if strings.HasPrefix(trimmed, "proxy-groups:") || strings.HasPrefix(trimmed, "rules:") {
+				break
+			}
+			kv := strings.SplitN(trimmed, ":", 2)
+			if len(kv) != 2 {
+				continue
+			}
+			k := strings.TrimSpace(kv[0])
+			v := strings.Trim(strings.TrimSpace(kv[1]), "\"")
+			switch k {
+			case "type":
+				proxyType = v
+			case "server":
+				server = v
+			case "port":
+				port, _ = strconv.Atoi(v)
+			case "uuid":
+				uuid = v
+			case "password":
+				password = v
+			case "tls":
+				tls = v == "true"
+			case "servername", "sni":
+				sni = v
+			case "network":
+				network = v
+			case "path":
+				path = v
+			case "host":
+				host = v
+			case "flow":
+				flow = v
+			case "client-fingerprint":
+				fp = v
+			case "public-key":
+				pubkey = v
+			case "short-id":
+				shortid = v
+			}
+		}
+	}
+
+	if server == "" || port == 0 {
+		return ""
+	}
+
+	if tls {
+		tlsSec = "tls"
+	}
+
+	switch proxyType {
+	case "vless":
+		u := url.URL{
+			Scheme:   "vless",
+			User:     url.User(uuid),
+			Host:     fmt.Sprintf("%s:%d", server, port),
+			Fragment: remarks,
+		}
+		q := url.Values{}
+		if network != "" {
+			q.Set("type", network)
+		}
+		if tlsSec != "" {
+			q.Set("security", tlsSec)
+		}
+		if sni != "" {
+			q.Set("sni", sni)
+		}
+		if path != "" {
+			q.Set("path", path)
+		}
+		if host != "" {
+			q.Set("host", host)
+		}
+		if flow != "" {
+			q.Set("flow", flow)
+		}
+		if fp != "" {
+			q.Set("fp", fp)
+		}
+		if pubkey != "" {
+			q.Set("pbk", pubkey)
+		}
+		if shortid != "" {
+			q.Set("sid", shortid)
+		}
+		u.RawQuery = q.Encode()
+		return u.String()
+	case "trojan":
+		u := url.URL{
+			Scheme:   "trojan",
+			User:     url.User(password),
+			Host:     fmt.Sprintf("%s:%d", server, port),
+			Fragment: remarks,
+		}
+		q := url.Values{}
+		if network != "" {
+			q.Set("type", network)
+		}
+		if tlsSec != "" {
+			q.Set("security", tlsSec)
+		}
+		if sni != "" {
+			q.Set("sni", sni)
+		}
+		if fp != "" {
+			q.Set("fp", fp)
+		}
+		u.RawQuery = q.Encode()
+		return u.String()
+	}
+	return ""
+}
+
 func buildNpvt(p V2RayConfig, s NapsterSettings, cfgText string, password string) (string, error) {
 	npvt := NpvtFile{
 		Version:     3,
@@ -662,7 +910,6 @@ func buildNpvt(p V2RayConfig, s NapsterSettings, cfgText string, password string
 		if err != nil {
 			return "", err
 		}
-		// wrap encrypted in a minimal JSON envelope
 		wrapper := map[string]interface{}{
 			"version":   3,
 			"encrypted": true,
@@ -676,8 +923,15 @@ func buildNpvt(p V2RayConfig, s NapsterSettings, cfgText string, password string
 }
 
 func parseNpvt(b64content string, password string) (*NpvtFile, string, error) {
+	content := strings.TrimSpace(b64content)
+
+	// ── BUG FIX: Handle "NPVT1 ..." legacy format from Napster app ──
+	if strings.HasPrefix(content, "NPVT1 ") || strings.HasPrefix(content, "NPVT1\t") {
+		return parseNpvtLegacy(content, password)
+	}
+
 	// decode base64
-	raw, err := tryDecodeBase64(strings.TrimSpace(b64content))
+	raw, err := tryDecodeBase64(content)
 	if err != nil {
 		return nil, "", fmt.Errorf("فایل npvt نامعتبر است")
 	}
@@ -685,13 +939,12 @@ func parseNpvt(b64content string, password string) (*NpvtFile, string, error) {
 	// check if it's a wrapper (encrypted)
 	var wrapper map[string]interface{}
 	if err := json.Unmarshal(raw, &wrapper); err != nil {
-		return nil, "", fmt.Errorf("JSON نامعتبر")
+		return nil, "", fmt.Errorf("JSON نامعتبر — فایل ممکن است NPVT1 فرمت باشد")
 	}
 
 	var jsonStr string
 
 	if enc, ok := wrapper["encrypted"].(bool); ok && enc {
-		// needs password
 		if password == "" {
 			return nil, "", fmt.Errorf("NEEDS_PASSWORD")
 		}
@@ -713,7 +966,10 @@ func parseNpvt(b64content string, password string) (*NpvtFile, string, error) {
 		return nil, "", fmt.Errorf("ساختار فایل npvt نامعتبر")
 	}
 
-	// reconstruct v2ray link if missing
+	// Check device lock
+	// (device lock validation happens client-side in Napster app;
+	//  server just returns the deviceLock field so UI can verify)
+
 	link := npvt.V2RayLink
 	if link == "" {
 		link = toV2RayLink(npvt.ParsedProxy)
@@ -798,7 +1054,6 @@ func handleGenerate(w http.ResponseWriter, r *http.Request) {
 	cfgText := buildNapsterConfig(p, req.Settings)
 	resp := GenerateResponse{Success: true, Config: cfgText}
 
-	// Build NPVT
 	pwd := ""
 	if req.Settings.EnablePassword {
 		pwd = req.Settings.Password
@@ -808,14 +1063,12 @@ func handleGenerate(w http.ResponseWriter, r *http.Request) {
 		resp.NpvtB64 = npvtB64
 	}
 
-	// Encrypted plain text version
 	if req.Settings.EnablePassword && req.Settings.Password != "" {
 		if enc, err := encrypt(cfgText, req.Settings.Password); err == nil {
 			resp.Encrypted = enc
 		}
 	}
 
-	// Save profile
 	appData := loadData()
 	prof := Profile{
 		ID:          uuid.New().String(),
