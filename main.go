@@ -530,37 +530,71 @@ func writeNetworkOpts(b *strings.Builder, p V2RayConfig) {
 	}
 }
 
-// ─── ساخت NPVT ───────────────────────────────────────────────────────────────
+// ─── ساخت NPVT (فرمت NPVT1 — سازگار با اپ Napster) ──────────────────────────
+//
+// فرمت خروجی:
+//   بدون رمز : NPVT1 <salt_b64>,<enc_config_b64>,<enc_v2link_b64>
+//   با رمز   : همان فرمت — salt و key از password مشتق می‌شوند
+//
+// هر بخش رمزشده = gcmEncrypt(key, plaintext)  →  nonce(12) + ciphertext + tag(16)
+// کلید = deriveKey(password, saltBytes)
+// اگر رمز نباشد از کلید ثابت "napster-default-open-key-v1" استفاده می‌شود
+// تا فایل همچنان در فرمت NPVT1 باشد و توسط اپ قابل خواندن باشد.
+
+const defaultNpvtKey = "napster-default-open-key-v1"
+
+func gcmEncrypt(plain, key []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	ct := gcm.Seal(nonce, nonce, plain, nil)
+	return ct, nil
+}
 
 func buildNpvt(p V2RayConfig, s NapsterSettings, cfgText string) (string, error) {
-	npvt := NpvtFile{
-		Version:     3,
-		CreatedAt:   time.Now().Format("2006-01-02T15:04:05Z"),
-		UserAgent:   s.UserAgent,
-		V2RayLink:   toV2RayLink(p),
-		ParsedProxy: p,
-		Settings:    s,
-		Config:      cfgText,
-		Encrypted:   false,
-	}
-	if s.EnableDeviceLock && s.DeviceID != "" {
-		npvt.DeviceLock = s.DeviceID
-	}
-
-	jsonBytes, err := json.MarshalIndent(npvt, "", "  ")
-	if err != nil { return "", err }
-
+	// تعیین رمز واقعی
+	password := defaultNpvtKey
 	if s.EnablePassword && s.Password != "" {
-		encStr, err := encrypt(string(jsonBytes), s.Password)
-		if err != nil { return "", err }
-		wrapper := map[string]interface{}{
-			"version": 3, "encrypted": true, "data": encStr,
-		}
-		wb, _ := json.Marshal(wrapper)
-		return base64.StdEncoding.EncodeToString(wb), nil
+		password = s.Password
 	}
 
-	return base64.StdEncoding.EncodeToString(jsonBytes), nil
+	// ساخت salt تصادفی 16 بایت
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+
+	key := deriveKey(password, salt)
+
+	// رمزگذاری config YAML
+	encConfig, err := gcmEncrypt([]byte(cfgText), key)
+	if err != nil {
+		return "", err
+	}
+
+	// رمزگذاری v2ray link
+	v2link := toV2RayLink(p)
+	encV2, err := gcmEncrypt([]byte(v2link), key)
+	if err != nil {
+		return "", err
+	}
+
+	saltB64 := base64.StdEncoding.EncodeToString(salt)
+	encConfigB64 := base64.StdEncoding.EncodeToString(encConfig)
+	encV2B64 := base64.StdEncoding.EncodeToString(encV2)
+
+	result := "NPVT1 " + saltB64 + "," + encConfigB64 + "," + encV2B64
+	// خروجی نهایی به صورت base64 برای انتقال امن از طریق JSON
+	return base64.StdEncoding.EncodeToString([]byte(result)), nil
 }
 
 // ─── Parse NPVT (هر دو فرمت) ─────────────────────────────────────────────────
@@ -568,16 +602,38 @@ func buildNpvt(p V2RayConfig, s NapsterSettings, cfgText string) (string, error)
 func parseNpvt(content, password string) (*NpvtFile, string, error) {
 	content = strings.TrimSpace(content)
 
-	// فرمت NPVT1 — از اپلیکیشن Napster
+	// ابتدا تلاش برای decode base64 (فرمت جدید این سرور که NPVT1 رو wrap می‌کنه)
+	if decoded, err := tryDecodeBase64(content); err == nil {
+		inner := strings.TrimSpace(string(decoded))
+		if strings.HasPrefix(inner, "NPVT1") {
+			content = inner
+		}
+	}
+
+	// فرمت NPVT1
 	if strings.HasPrefix(content, "NPVT1") {
-		cfgYAML, v2link, err := decryptNPVT1(content, password)
-		if err != nil { return nil, "", err }
+		// تشخیص اینکه آیا رمز داره
+		// اگر password خالی بود اول با کلید پیش‌فرض امتحان می‌کنیم
+		tryPassword := password
+		if tryPassword == "" {
+			tryPassword = defaultNpvtKey
+		}
+
+		cfgYAML, v2link, err := decryptNPVT1(content, tryPassword)
+		if err != nil {
+			// اگر با کلید پیش‌فرض شکست خورد یعنی واقعاً رمز دارد
+			if password == "" {
+				return nil, "", fmt.Errorf("NEEDS_PASSWORD")
+			}
+			return nil, "", err
+		}
+
 		synthetic := &NpvtFile{
 			Version:   1,
 			CreatedAt: time.Now().Format("2006-01-02T15:04:05Z"),
 			Config:    cfgYAML,
 			V2RayLink: v2link,
-			Encrypted: true,
+			Encrypted: password != "" && password != defaultNpvtKey,
 		}
 		if v2link != "" {
 			if cfg, err := parseV2RayLink(v2link); err == nil {
@@ -587,10 +643,10 @@ func parseNpvt(content, password string) (*NpvtFile, string, error) {
 		return synthetic, v2link, nil
 	}
 
-	// فرمت base64 JSON — از این سرور
+	// فرمت قدیمی base64 JSON — برای backward compatibility
 	raw, err := tryDecodeBase64(content)
 	if err != nil {
-		return nil, "", fmt.Errorf("فایل نامعتبر — نه NPVT1 است نه base64")
+		return nil, "", fmt.Errorf("فایل نامعتبر — فرمت شناخته‌نشده")
 	}
 
 	var wrapper map[string]interface{}
@@ -600,11 +656,17 @@ func parseNpvt(content, password string) (*NpvtFile, string, error) {
 
 	var jsonStr string
 	if enc, ok := wrapper["encrypted"].(bool); ok && enc {
-		if password == "" { return nil, "", fmt.Errorf("NEEDS_PASSWORD") }
+		if password == "" {
+			return nil, "", fmt.Errorf("NEEDS_PASSWORD")
+		}
 		dataStr, ok := wrapper["data"].(string)
-		if !ok { return nil, "", fmt.Errorf("ساختار فایل رمزشده نامعتبر") }
+		if !ok {
+			return nil, "", fmt.Errorf("ساختار فایل رمزشده نامعتبر")
+		}
 		decrypted, err := decrypt(dataStr, password)
-		if err != nil { return nil, "", err }
+		if err != nil {
+			return nil, "", err
+		}
 		jsonStr = decrypted
 	} else {
 		jsonStr = string(raw)
@@ -616,7 +678,9 @@ func parseNpvt(content, password string) (*NpvtFile, string, error) {
 	}
 
 	link := npvt.V2RayLink
-	if link == "" { link = toV2RayLink(npvt.ParsedProxy) }
+	if link == "" {
+		link = toV2RayLink(npvt.ParsedProxy)
+	}
 	return &npvt, link, nil
 }
 
